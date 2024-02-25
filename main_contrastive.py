@@ -1,9 +1,25 @@
 import argparse
 import os
+import sys
+import logging
+from typing import Any
+import torch
+import time
 from dataset import *
 from utils import *
 from glob import glob
-import logging
+import torch.nn as nn
+import torchvision
+from tqdm import tqdm
+from torch.utils.tensorboard import SummaryWriter
+from datetime import datetime
+from torchvision import transforms
+from PIL import Image
+from torchvision.models.optical_flow import Raft_Large_Weights, raft_large
+import torchvision.transforms.functional as F
+import random
+from pytorch_metric_learning import losses
+
 
 class L_CropAndZeroPad:
     def __call__(self, image):
@@ -61,17 +77,55 @@ class ZoomAndZeroPad:
         return new_image
 
 
+
+class RegressionModel(nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super(RegressionModel, self).__init__()
+        self.fc1 = nn.Linear(input_dim, 512)
+        self.relu1 = nn.ReLU()
+
+        self.fc2 = nn.Linear(512, 512)
+        self.relu2 = nn.ReLU()
+
+        self.fc3 = nn.Linear(512, 64)
+        self.relu3 = nn.ReLU()
+
+        self.fc4 = nn.Linear(64, output_dim)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.relu1(x)
+        x = self.fc2(x)
+        x = self.relu2(x)
+        x = self.fc3(x)
+        x = self.relu3(x)
+        x = self.fc4(x)        
+        return x
+
+class CombinedModel(nn.Module):
+    def __init__(self, resnet, custom_mlp):
+        super(CombinedModel, self).__init__()
+        self.resnet = resnet
+        self.custom_mlp = custom_mlp
+
+    def forward(self, x):
+        x = self.resnet(x)
+        x = x.view(x.size(0), -1)
+        x = self.custom_mlp(x)
+        return x
+
+
 def parse_option():
     parser = argparse.ArgumentParser('argument for training')
 
-    parser.add_argument('--print_freq', type=int, default=50, help='print frequency')
-    parser.add_argument('--save_freq', type=int, default=50, help='save frequency')
+    parser.add_argument('--print_freq', type=int, default=20, help='print frequency')
+    parser.add_argument('--save_freq', type=int, default=100, help='save frequency')
     parser.add_argument('--save_curr_freq', type=int, default=1, help='save curr last frequency')
 
-    parser.add_argument('--batch_size', type=int, default=32, help='batch_size')
+    parser.add_argument('--batch_size', type=int, default=128, help='batch_size')
     parser.add_argument('--num_workers', type=int, default=12, help='num of workers to use')
     parser.add_argument('--epochs', type=int, default=40000, help='number of training epochs')
-    parser.add_argument('--learning_rate', type=float, default=0.5, help='learning rate')
+    parser.add_argument('--learning_rate', type=float, default=0.0005, help='learning rate')
     parser.add_argument('--lr_decay_rate', type=float, default=0.1, help='decay rate for learning rate')
     parser.add_argument('--weight_decay', type=float, default=1e-4, help='weight decay')
     parser.add_argument('--momentum', type=float, default=0.9, help='momentum')
@@ -90,7 +144,7 @@ def parse_option():
 
     opt = parser.parse_args()
 
-    opt.model_path = '/scratch/zbhatt1/save_models/all_aug/{}_models'.format(opt.dataset)
+    opt.model_path = '/scratch/zbhatt1/save_models/simclr/{}_models'.format(opt.dataset)
     opt.model_name = 'RnC_{}_{}_ep_{}_lr_{}_d_{}_wd_{}_mmt_{}_bsz_{}_aug_{}_temp_{}_label_{}_feature_{}_trial_{}'. \
         format(opt.dataset, opt.model, opt.epochs, opt.learning_rate, opt.lr_decay_rate, opt.weight_decay, opt.momentum,
                opt.batch_size, opt.aug, opt.temp, opt.label_diff, opt.feature_sim, opt.trial)
@@ -175,23 +229,151 @@ def set_loader(opt):
     return train_loader
 
 
-if __name__ == '__main__':
-    opt = parse_option()
+def set_model(opt):
+    encoder_model = torchvision.models.resnet50()
+    encoder_model.conv1 = torch.nn.Conv2d(2, 64, kernel_size=7, stride=2, padding=3,bias=False)
+    encoder_model = torch.nn.Sequential(*list(encoder_model.children())[:-1])
+    contrastive_criterion = losses.NTXentLoss(temperature=0.1)#torch.nn.MSELoss()
+    mse_criterion = torch.nn.MSELoss()
 
-    train_loader = set_loader(opt)
+    mlp = RegressionModel(2048, 6)
 
+    if torch.cuda.is_available():
+        if torch.cuda.device_count() > 1:
+            encoder_model = torch.nn.DataParallel(encoder_model)
+        encoder_model = encoder_model.cuda()
+        mlp = mlp.cuda()
+        contrastive_criterion = contrastive_criterion.cuda()
+        mse_criterion = mse_criterion.cuda()
+        torch.backends.cudnn.benchmark = True
+
+    return encoder_model, mlp, contrastive_criterion, mse_criterion
+
+
+def train(train_loader, encoder_model, mlp, contrastive_criterion, mse_criterion, optimizer, epoch, opt):
+
+    encoder_model.train()
+    mlp.train()
+
+    batch_time = AverageMeter()
+    data_time = AverageMeter()
+    contrastive_losses = AverageMeter()
+    mse_losses = AverageMeter()
+
+    end = time.time()
     for idx, data_tuple in enumerate(train_loader):
         images, labels = data_tuple
         base_image = images[0]
-        left_aug = images[1]
-        right_aug = images[2]
-        zoom_aug = images[3]
+        left_image = images[1]
+        right_image = images[2]
+        zoom_image = images[3]
 
-        print(f"Base Image: {base_image.shape}")
-        print(f"Left Aug: {left_aug.shape}")
-        print(f"Right Aug: {right_aug.shape}")
-        print(f"Zoom Aug: {zoom_aug.shape}")
+        base_labels = torch.arange(base_image.shape[0])
+        left_labels = torch.arange(base_image.shape[0])
+        right_labels = torch.arange(base_image.shape[0])
+        zoom_labels = torch.arange(base_image.shape[0])
+
+        images = torch.cat((base_image, left_image, right_image, zoom_image))
+        unlabels = torch.cat((base_labels, left_labels, right_labels, zoom_labels))
         
-        see_pictures(base_image, left_aug, right_aug, zoom_aug)
+        data_time.update(time.time() - end)
+        bsz = unlabels.shape[0]
+
+        if torch.cuda.is_available():
+            images = images.cuda(non_blocking=True)
+            unlabels = unlabels.cuda(non_blocking=True)
+            labels = labels.cuda(non_blocking=True)
         
-        break
+        features = encoder_model(images)
+        features = features.float()
+        labels = labels.float()
+        features = features.squeeze()
+        unlabels = unlabels.squeeze()
+
+        output = mlp(features[:int(bsz/4), :])
+        
+        contrastive_loss = contrastive_criterion(features, unlabels)
+        
+        labels = labels.squeeze()
+
+        mse_loss = mse_criterion(output, labels)
+
+        loss = contrastive_loss + (1e3 * mse_loss)
+
+        contrastive_losses.update(loss.item(), bsz)
+        mse_losses.update(loss.item(), bsz)
+
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(encoder_model.parameters(), 1.0)
+        optimizer.step()
+
+        batch_time.update(time.time() - end)
+        end = time.time()
+
+        # if (idx + 1) % opt.print_freq == 0:
+        #     to_print = 'Train: [{0}][{1}/{2}]\t' \
+        #                'BT {batch_time.val:.3f} ({batch_time.avg:.3f})\t' \
+        #                'DT {data_time.val:.3f} ({data_time.avg:.3f})\t' \
+        #                '({loss.avg:.5f})'.format(
+        #         epoch, idx + 1, len(train_loader), batch_time=batch_time,
+        #         data_time=data_time, loss=mse_loss
+        #     )
+        #     print(to_print)
+        #     sys.stdout.flush()
+        if (idx + 1) % opt.print_freq == 0:
+            print(f"Epoch: {epoch} | Batch: {idx} | Contrastive Loss: {contrastive_loss} | MSE Loss: {mse_loss}")
+    return contrastive_losses.avg, mse_losses.avg
+
+
+def main():
+    opt = parse_option()
+
+    # build data loader
+    train_loader = set_loader(opt)
+
+    # build model and criterion
+    encoder_model, mlp, contrastive_criterion, mse_criterion = set_model(opt)
+    full_model = CombinedModel(encoder_model, mlp)
+
+    # build optimizer
+    optimizer = set_optimizer(opt, full_model)
+
+    start_epoch = 1
+    if len(opt.resume):
+        ckpt_state = torch.load(opt.resume)
+        full_model.load_state_dict(ckpt_state['model'])
+        optimizer.load_state_dict(ckpt_state['optimizer'])
+        start_epoch = ckpt_state['epoch'] + 1
+        print(f"<=== Epoch [{ckpt_state['epoch']}] Resumed from {opt.resume}!")
+
+    writer = SummaryWriter(log_dir='/scratch/zbhatt1/save_models/simclr/logs')
+    # training routine
+    
+    for epoch in tqdm(range(start_epoch, opt.epochs + 1)):
+        adjust_learning_rate(opt, optimizer, epoch, writer)
+        
+        contrastive_loss, mse_loss = train(train_loader, encoder_model, mlp, contrastive_criterion, mse_criterion, optimizer, epoch, opt)
+        # latent_features = torch.cat((latent_features, features), dim=0)
+        # torch.save(latent_features, '/data/data/matt/VO/matric_code/save_models/four_aug152/latents.pt')
+
+        if epoch % opt.save_freq == 0:
+            save_file = os.path.join(
+                opt.save_folder, 'ckpt_epoch_{epoch}.pth'.format(epoch=epoch))
+            save_model(full_model, optimizer, opt, epoch, save_file)
+
+        if epoch % opt.save_curr_freq == 0:
+            save_file = os.path.join(opt.save_folder, 'curr_last.pth')
+            save_model(full_model, optimizer, opt, epoch, save_file)
+
+        writer.add_scalar("Contrastive Loss", contrastive_loss, epoch)
+        writer.add_scalar("MLP loss", mse_loss, epoch)
+
+    # save the last model
+    save_file = os.path.join(opt.save_folder, 'last.pth')
+    save_model(full_model, optimizer, opt, opt.epochs, save_file)
+
+
+
+if __name__ == '__main__':
+    main()
