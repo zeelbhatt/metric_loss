@@ -127,34 +127,35 @@ class AverageMeter(object):
         self.avg = self.sum / self.count
 
 
-# def adjust_learning_rate(args, optimizer, epoch):
-#     lr = args.learning_rate
-#     eta_min = lr * (args.lr_decay_rate ** 3)
-#     lr = eta_min + (lr - eta_min) * (1 + math.cos(math.pi * epoch / args.epochs)) / 2
-#     for param_group in optimizer.param_groups:
-#         param_group['lr'] = lr
-
-
 def adjust_learning_rate(args, optimizer, epoch, writer):
     lr = args.learning_rate
-    total_epochs = args.epochs
-    cycles = 5  # Number of cycles you want
-    
-    # Compute the total number of iterations for the given number of cycles
-    total_iterations = total_epochs * cycles
-    
-    # Compute the minimum learning rate at the end of each cycle
-    eta_min = lr * (args.lr_decay_rate ** cycles)
-    
-    # Compute the current cycle and epoch within that cycle
-    current_cycle = min(1 + epoch / total_epochs, cycles)
-    current_epoch_in_cycle = epoch % (total_epochs / cycles)  # Corrected line
-    
-    # Compute the current learning rate based on the cosine annealing schedule
-    lr = eta_min + 0.5 * (lr - eta_min) * (1 + math.cos(math.pi * current_epoch_in_cycle / (total_epochs / cycles)))
+    eta_min = lr * (args.lr_decay_rate ** 3)
+    lr = eta_min + (lr - eta_min) * (1 + math.cos(math.pi * epoch / args.epochs)) / 2
     writer.add_scalar('Learning Rate', lr, epoch)
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
+
+
+# def adjust_learning_rate(args, optimizer, epoch, writer):
+#     lr = args.learning_rate
+#     total_epochs = args.epochs
+#     cycles = 5  # Number of cycles you want
+    
+#     # Compute the total number of iterations for the given number of cycles
+#     total_iterations = total_epochs * cycles
+    
+#     # Compute the minimum learning rate at the end of each cycle
+#     eta_min = lr * (args.lr_decay_rate ** cycles)
+    
+#     # Compute the current cycle and epoch within that cycle
+#     current_cycle = min(1 + epoch / total_epochs, cycles)
+#     current_epoch_in_cycle = epoch % (total_epochs / cycles)  # Corrected line
+    
+#     # Compute the current learning rate based on the cosine annealing schedule
+#     lr = eta_min + 0.5 * (lr - eta_min) * (1 + math.cos(math.pi * current_epoch_in_cycle / (total_epochs / cycles)))
+#     writer.add_scalar('Learning Rate', lr, epoch)
+#     for param_group in optimizer.param_groups:
+#         param_group['lr'] = lr
 
 
 def save_model(model, optimizer, opt, epoch, save_file):
