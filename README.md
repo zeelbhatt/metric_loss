@@ -24,14 +24,17 @@ You have to change few file paths in the main_contrastive.py
 ### Installation steps on SOL
 
 ## SOL related intial commands:
-- module load mamba/latest
-- module load cuda-11.8.XXXXX
+```bash
+module load mamba/latest
+module load cuda-11.8.XXXXX
+```
 
 ## install dependencies:
-- conda create -n febenv python=3.9
-
-- conda install pytorch torchvision pytorch-cuda=11.8 -c pytorch -c nvidia
-- pip install six
-- conda install scipy
-- conda install matplotlib
-- pip install tqdm
+```bash
+conda create -n febenv python=3.9
+conda install pytorch torchvision pytorch-cuda=11.8 -c pytorch -c nvidia
+pip install six
+conda install scipy
+conda install matplotlib
+pip install tqdm
+```
